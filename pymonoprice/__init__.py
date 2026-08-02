@@ -184,17 +184,33 @@ class Monoprice:
     def _process_request(self, request: bytes, num_eols_to_read: int = 1) -> str:
         """
         Send a request, transparently reconnecting and retrying once if the
-        connection has died (e.g. the serial-TCP bridge rebooted).
+        *connection* has died (e.g. the serial-TCP bridge rebooted).
+
+        A bare read timeout is deliberately NOT treated as a dead connection.
+        pyserial's ``socket://`` handler surfaces the two cases differently:
+        a slow/quiet amp makes ``read()`` return no bytes, which we raise as
+        ``SerialTimeoutException`` while the socket stays perfectly healthy;
+        a genuinely dropped peer makes ``recv()`` return 0, which pyserial
+        raises as a plain ``SerialException('socket disconnected')``. Only the
+        latter should reconnect. Reconnecting on every timeout churns the link,
+        and against a multi-client serial-TCP bridge each extra overlapping
+        connection causes cross-talk and can exhaust the bridge's sockets.
 
         :param request: request that is sent to the monoprice
         :param num_eols_to_read: number of EOL sequences to read. When last EOL is read, reading stops
         :return: ascii string returned by monoprice
-        :raises MonopriceConnectionError: command failed and reconnect+retry also failed
+        :raises serial.SerialTimeoutException: the amp did not answer in time (connection is fine)
+        :raises MonopriceConnectionError: the connection died and reconnect+retry also failed
         """
         try:
             if self._port is None:
                 self._open_port()
             return self._process_request_once(request, num_eols_to_read)
+        except serial.SerialTimeoutException:
+            # The amp did not answer within TIMEOUT, but the socket is alive.
+            # Do not reconnect — surface the timeout unchanged and leave the
+            # (healthy) port open for the next command.
+            raise
         except (serial.SerialException, OSError) as first_error:
             _LOGGER.warning(
                 "Command %r to %s failed (%s); reconnecting and retrying once",
@@ -205,15 +221,17 @@ class Monoprice:
             try:
                 self._reconnect()
                 result = self._process_request_once(request, num_eols_to_read)
+            except serial.SerialTimeoutException:
+                # Reconnect succeeded (fresh, live socket) but the amp still
+                # did not answer the retried command. That is a timeout, not a
+                # connection failure: preserve the timeout contract and keep
+                # the healthy port open for the next call.
+                raise
             except (serial.SerialException, OSError) as retry_error:
-                # Leave the port closed so the NEXT call starts with a fresh
-                # connection attempt — the connection never sticks in a dead state.
+                # Reconnect or the retried write itself failed — the link is
+                # genuinely dead. Leave the port closed so the NEXT call starts
+                # with a fresh connection attempt.
                 self._close_port()
-                if isinstance(retry_error, serial.SerialTimeoutException):
-                    # Preserve the pre-existing exception contract for timeouts:
-                    # callers (and the upstream test suite) expect
-                    # SerialTimeoutException when the amp does not answer.
-                    raise
                 raise MonopriceConnectionError(
                     "Command {!r} to {} failed after reconnect: {}".format(
                         request, self._port_url, retry_error
