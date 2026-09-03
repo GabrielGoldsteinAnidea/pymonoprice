@@ -53,6 +53,11 @@ class AmpHandler(socketserver.BaseRequestHandler):
                 # times out. Used to prove a bare timeout does NOT reconnect.
                 if getattr(self.server, "silent", False):
                     continue
+                # Skip replying to the next N commands, then resume — models a
+                # transient slow response that the same-connection retry catches.
+                if getattr(self.server, "skip_next", 0) > 0:
+                    self.server.skip_next -= 1
+                    continue
                 try:
                     if cmd.startswith(b"?"):
                         self.request.sendall(ZONE_STATUS)
@@ -70,6 +75,7 @@ class AmpServer(socketserver.ThreadingTCPServer):
     def __init__(self, *a, **kw):
         self.conns = set()
         self.silent = False
+        self.skip_next = 0
         super().__init__(*a, **kw)
 
 
@@ -163,17 +169,17 @@ def test_reconnect_scenarios():
     check("MonopriceConnectionError subclasses serial.SerialException",
           issubclass(pm.MonopriceConnectionError, serial.SerialException))
 
-    # --- 6. Quiet amp: a bare read timeout must NOT reconnect ---
-    # The socket stays alive; only the reply is missing (slow/busy amp).
-    # Reconnecting here would churn the link and, against a multi-client
-    # serial-TCP bridge, create overlapping connections. The command must
-    # raise SerialTimeoutException (not MonopriceConnectionError), the port
-    # object must be unchanged (no reconnect), and it must stay open.
+    # --- 6. Persistently quiet amp: a bare read timeout must NOT reconnect ---
+    # The socket stays alive; only the reply is missing (slow/busy amp). The
+    # client retries ONCE on the same connection (no reconnect — that would
+    # churn a multi-client serial-TCP bridge). With the amp silent for both
+    # attempts the command must raise SerialTimeoutException (not
+    # MonopriceConnectionError), leave the port object unchanged, and keep it
+    # open.
     port_before = amp._port
     check("precondition: connection is open before quiet-amp test", port_before is not None)
-    amp._port.timeout = 0.5  # keep the test quick; only affects this socket
+    amp._port.timeout = 0.5  # keep the test quick; two attempts of 0.5s
     bridge.server.silent = True
-    reconnected = None
     try:
         amp.zone_status(11)
         outcome = "no_error"
@@ -191,6 +197,20 @@ def test_reconnect_scenarios():
     st = amp.zone_status(11)
     check("quiet amp -> same connection recovers on next command",
           st is not None and st.zone == 11)
+
+    # --- 7. Transient slow amp: first attempt times out, same-socket retry
+    # succeeds. Proves the timeout retry recovers WITHOUT a reconnect. ---
+    port_before = amp._port
+    bridge.server.skip_next = 1  # ignore exactly one command, answer the retry
+    try:
+        st = amp.zone_status(11)
+        transient_ok = st is not None and st.zone == 11
+    except Exception as e:  # noqa: BLE001
+        transient_ok = False
+        print("   unexpected:", repr(e))
+    check("transient timeout -> same-connection retry succeeds", transient_ok)
+    check("transient timeout -> NOT reconnected (same port object)",
+          amp._port is port_before)
 
     bridge.stop()
     print("\nALL SCENARIOS PASSED")

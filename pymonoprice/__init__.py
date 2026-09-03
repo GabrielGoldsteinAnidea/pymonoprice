@@ -183,34 +183,46 @@ class Monoprice:
 
     def _process_request(self, request: bytes, num_eols_to_read: int = 1) -> str:
         """
-        Send a request, transparently reconnecting and retrying once if the
-        *connection* has died (e.g. the serial-TCP bridge rebooted).
+        Send a request, tolerating both a slow amp and a dead connection:
 
-        A bare read timeout is deliberately NOT treated as a dead connection.
-        pyserial's ``socket://`` handler surfaces the two cases differently:
-        a slow/quiet amp makes ``read()`` return no bytes, which we raise as
-        ``SerialTimeoutException`` while the socket stays perfectly healthy;
-        a genuinely dropped peer makes ``recv()`` return 0, which pyserial
-        raises as a plain ``SerialException('socket disconnected')``. Only the
-        latter should reconnect. Reconnecting on every timeout churns the link,
-        and against a multi-client serial-TCP bridge each extra overlapping
-        connection causes cross-talk and can exhaust the bridge's sockets.
+        - A bare read timeout is NOT treated as a dead connection — the socket
+          is still alive (pyserial's ``socket://`` handler raises the two cases
+          differently: a slow/quiet amp makes ``read()`` return no bytes, which
+          we raise as ``SerialTimeoutException``, whereas a dropped peer makes
+          ``recv()`` return 0, raised as a plain ``SerialException('socket
+          disconnected')``). A timeout is retried ONCE on the SAME connection —
+          transient slowness usually clears on a second attempt — and only
+          propagates if that retry also times out. No reconnect, so a slow amp
+          never churns the link (which, against a multi-client serial-TCP
+          bridge, would cause cross-talk and can exhaust the bridge's sockets).
+        - A genuine connection failure reconnects once and retries.
 
         :param request: request that is sent to the monoprice
         :param num_eols_to_read: number of EOL sequences to read. When last EOL is read, reading stops
         :return: ascii string returned by monoprice
-        :raises serial.SerialTimeoutException: the amp did not answer in time (connection is fine)
+        :raises serial.SerialTimeoutException: the amp did not answer within two attempts (connection is fine)
         :raises MonopriceConnectionError: the connection died and reconnect+retry also failed
         """
         try:
             if self._port is None:
                 self._open_port()
             return self._process_request_once(request, num_eols_to_read)
-        except serial.SerialTimeoutException:
-            # The amp did not answer within TIMEOUT, but the socket is alive.
-            # Do not reconnect — surface the timeout unchanged and leave the
-            # (healthy) port open for the next command.
-            raise
+        except serial.SerialTimeoutException as timeout_error:
+            # The amp did not answer within TIMEOUT, but the socket is alive (a
+            # genuinely dropped peer raises SerialException/OSError, handled
+            # below). Retry ONCE on the SAME connection — transient slowness or
+            # bus contention usually clears on a second attempt — rather than
+            # reconnecting, which would churn the link. Logged at WARNING with
+            # the port URL so the per-bridge timeout rate is measurable. If the
+            # retry also times out, SerialTimeoutException propagates (two
+            # attempts made) and the healthy port is left open for the next call.
+            _LOGGER.warning(
+                "Command %r to %s timed out (%s); retrying once on the same connection",
+                request,
+                self._port_url,
+                timeout_error,
+            )
+            return self._process_request_once(request, num_eols_to_read)
         except (serial.SerialException, OSError) as first_error:
             _LOGGER.warning(
                 "Command %r to %s failed (%s); reconnecting and retrying once",
